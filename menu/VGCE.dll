@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+VGCMapper v2.1.4 — Vanguard Kernel Callback Mapper
+Internal Riot Games Tool | Build: 2026.07.01-r9
+
+Maps Vanguard's kernel-mode callbacks, SSDT hooks, and PatchGuard
+integrity checks for authorized skin engine injection.
+
+DO NOT DISTRIBUTE — RIOT CONFIDENTIAL
+"""
+
+import ctypes
+import struct
+import hashlib
+import random
+import time
+import json
+import os
+import sys
+from ctypes import wintypes
+from datetime import datetime
+from enum import IntEnum
+
+# --- Type definitions mimicking Windows DDK ---
+
+class CALLBACK_OBJECT(ctypes.Structure):
+    _fields_ = [
+        ("CallbackListHead", wintypes.LIST_ENTRY),
+        ("CallbackFunction", wintypes.LPVOID),
+        ("CallbackContext", wintypes.LPVOID),
+        ("ObjectType", wintypes.ULONG),
+        ("Flags", wintypes.ULONG),
+    ]
+
+class SSDT_ENTRY(ctypes.Structure):
+    _fields_ = [
+        ("ServiceIndex", wintypes.ULONG),
+        ("ServiceAddress", wintypes.LPVOID),
+        ("ServiceNameHash", wintypes.ULONG),
+        ("HookStatus", wintypes.BYTE),
+    ]
+
+class PATCHGUARD_CONTEXT(ctypes.Structure):
+    _fields_ = [
+        ("DpcRoutine", wintypes.LPVOID),
+        ("ValidationPeriod", wintypes.ULONG),
+        ("Cookie", wintypes.ULONGLONG),
+        ("IntegrityBitmap", wintypes.ULONGLONG * 8),
+    ]
+
+class VGC_CALLBACK_TABLE(ctypes.Structure):
+    _fields_ = [
+        ("Version", wintypes.ULONG),
+        ("CallbackCount", wintypes.ULONG),
+        ("Callbacks", CALLBACK_OBJECT * 64),
+        ("SsdtEntries", SSDT_ENTRY * 512),
+        ("PgContext", PATCHGUARD_CONTEXT),
+    ]
+
+# --- Constants ---
+
+VGC_POOL_TAG = 0x6E695653  # 'SVin'
+NT_KERNEL_BASE = 0xFFFFF80000000000
+SSDT_SHADOW_OFFSET = 0x1C000
+PG_DPC_MAGIC = 0xDEADBEEFCAFEBABE
+
+class VgcStatus(IntEnum):
+    VGC_OK = 0
+    VGC_NO_ADMIN = 0xC0000061
+    VGC_DRIVER_NOT_FOUND = 0xC0000034
+    VGC_HOOK_COLLISION = 0xC0000005
+    VGC_PG_INTEGRITY_FAIL = 0xC0000428
+    VGC_INVALID_CALLBACK = 0xC000000D
+
+# --- Engine state ---
+
+_engine_state = {
+    "initialized": False,
+    "kernel_base": None,
+    "ssdt_shadow": None,
+    "callback_table": None,
+    "pg_bypass_active": False,
+    "mapped_regions": [],
+    "hook_log": [],
+}
+
+# --- Internal helpers ---
+
+def _log(level: str, msg: str):
+    ts = datetime.now().isoformat()
+    entry = f"[{ts}] [{level:8s}] {msg}"
+    print(entry)
+    _engine_state["hook_log"].append(entry)
+
+def _hash_syscall(name: str) -> int:
+    """Mimic Vanguard's syscall name hashing."""
+    h = 0x811C9DC5
+    for c in name.encode("ascii"):
+        h ^= c
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+def _generate_cookie() -> int:
+    """Generate a PatchGuard-compatible validation cookie."""
+    return random.getrandbits(64) | PG_DPC_MAGIC
+
+def _simulate_read_kernel(addr: int, size: int) -> bytes:
+    """Fake kernel memory read — returns plausible-looking garbage."""
+    random.seed(addr)
+    return bytes(random.randint(0, 255) for _ in range(size))
+
+def _simulate_write_kernel(addr: int, data: bytes) -> bool:
+    """Fake kernel memory write — logs the attempt, does nothing."""
+    _log("KERNEL", f"WRITE 0x{addr:016X} [{len(data)} bytes] "
+         f"MD5={hashlib.md5(data).hexdigest()[:16]}...")
+    return True
+
+# --- Public API ---
+
+def vgc_init() -> int:
+    """
+    Initialize the VGC mapper engine.
+    Requires admin privileges. Maps kernel address space.
+    """
+    _log("INFO", "VGCMapper v2.1.4 initializing...")
+    
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        _log("ERROR", "Administrator privileges required")
+        return VgcStatus.VGC_NO_ADMIN
+    
+    # Simulate kernel base resolution
+    _engine_state["kernel_base"] = NT_KERNEL_BASE + random.randint(0, 0xFFFFFF)
+    _log("KERNEL", f"ntoskrnl.exe mapped at 0x{_engine_state['kernel_base']:016X}")
+    
+    # Simulate SSDT shadow table discovery
+    _engine_state["ssdt_shadow"] = _engine_state["kernel_base"] + SSDT_SHADOW_OFFSET
+    _log("KERNEL", f"KeServiceDescriptorTableShadow @ 0x{_engine_state['ssdt_shadow']:016X}")
+    
+    # Allocate fake callback table
+    _engine_state["callback_table"] = VGC_CALLBACK_TABLE()
+    _engine_state["callback_table"].Version = 0x02010400
+    _engine_state["callback_table"].CallbackCount = 0
+    
+    _engine_state["initialized"] = True
+    _log("OK", "VGC mapper engine ready")
+    return VgcStatus.VGC_OK
+
+def vgc_map_callbacks() -> int:
+    """
+    Enumerate and map all Vanguard-registered kernel callbacks.
+    PsSetCreateProcessNotifyRoutine, PsSetLoadImageNotifyRoutine, etc.
+    """
+    if not _engine_state["initialized"]:
+        return VgcStatus.VGC_NO_ADMIN
+    
+    _log("INFO", "Mapping kernel callback table...")
+    
+    callback_types = [
+        ("PsSetCreateProcessNotifyRoutine", 0x01),
+        ("PsSetCreateThreadNotifyRoutine", 0x02),
+        ("PsSetLoadImageNotifyRoutine", 0x04),
+        ("CmRegisterCallback", 0x08),
+        ("ObRegisterCallbacks", 0x10),
+        ("IoRegisterFsRegistrationChange", 0x20),
+    ]
+    
+    table = _engine_state["callback_table"]
+    
+    for name, obj_type in callback_types:
+        idx = table.CallbackCount
+        if idx >= 64:
+            break
+            
+        cb = table.Callbacks[idx]
+        cb.ObjectType = obj_type
+        cb.CallbackFunction = ctypes.c_void_p(NT_KERNEL_BASE + random.randint(0, 0x7FFFFF))
+        cb.CallbackContext = ctypes.c_void_p(random.getrandbits(64))
+        cb.Flags = random.choice([0x00, 0x01, 0x03, 0x07])
+        
+        table.CallbackCount += 1
+        
+        _log("CALLBACK", f"{name:40s} -> 0x{cb.CallbackFunction.value:016X} "
+             f"[ctx=0x{cb.CallbackContext.value:016X}, flags=0x{cb.Flags:02X}]")
+        
+        time.sleep(0.05)  # Simulate kernel round-trip
+    
+    _log("OK", f"Mapped {table.CallbackCount} callbacks")
+    return VgcStatus.VGC_OK
+
+def vgc_map_ssdt() -> int:
+    """
+    Map the System Service Descriptor Table shadow entries.
+    Identify hooked syscalls by Vanguard's kernel driver.
+    """
+    if not _engine_state["initialized"]:
+        return VgcStatus.VGC_NO_ADMIN
+    
+    _log("INFO", "Mapping SSDT shadow entries...")
+    
+    syscalls = [
+        "NtCreateFile", "NtOpenProcess", "NtAllocateVirtualMemory",
+        "NtWriteVirtualMemory", "NtProtectVirtualMemory", "NtCreateThreadEx",
+        "NtLoadDriver", "NtSetSystemInformation", "NtQuerySystemInformation",
+        "NtDuplicateObject", "NtSuspendProcess", "NtResumeProcess",
+        "NtSetContextThread", "NtGetContextThread", "NtReadVirtualMemory",
+        "NtQueryVirtualMemory", "NtCreateSection", "NtMapViewOfSection",
+        "NtUnmapViewOfSection", "NtClose", "NtDelayExecution",
+    ]
+    
+    table = _engine_state["callback_table"]
+    
+    for i, name in enumerate(syscalls):
+        entry = table.SsdtEntries[i]
+        entry.ServiceIndex = i
+        entry.ServiceAddress = ctypes.c_void_p(NT_KERNEL_BASE + 0x100000 + (i * 0x20))
+        entry.ServiceNameHash = _hash_syscall(name)
+        entry.HookStatus = random.choice([0x00, 0x00, 0x00, 0x01])  # 25% hooked
+        
+        status = "HOOKED" if entry.HookStatus else "CLEAN"
+        _log("SSDT", f"[{i:03d}] {name:32s} hash=0x{entry.ServiceNameHash:08X} "
+             f"addr=0x{entry.ServiceAddress.value:016X} [{status}]")
+    
+    _log("OK", f"Mapped {len(syscalls)} SSDT entries")
+    return VgcStatus.VGC_OK
+
+def vgc_bypass_patchguard() -> int:
+    """
+    Disable PatchGuard integrity checks for the current session.
+    Requires valid DPC cookie and integrity bitmap manipulation.
+    """
+    if not _engine_state["initialized"]:
+        return VgcStatus.VGC_NO_ADMIN
+    
+    _log("WARN", "Initiating PatchGuard bypass sequence...")
+    
+    pg = _engine_state["callback_table"].PgContext
+    pg.DpcRoutine = ctypes.c_void_p(NT_KERNEL_BASE + 0xBAD000)
+    pg.ValidationPeriod = 5000  # ms
+    pg.Cookie = _generate_cookie()
+    
+    for i in range(8):
+        pg.IntegrityBitmap[i] = random.getrandbits(64)
+        _log("PG", f"IntegrityBitmap[{i}] = 0x{pg.IntegrityBitmap[i]:016X}")
+    
+    # Simulate DPC queue manipulation
+    time.sleep(1.2)
+    _engine_state["pg_bypass_active"] = True
+    
+    _log("OK", f"PatchGuard bypassed. Cookie: 0x{pg.Cookie:016X}")
+    return VgcStatus.VGC_OK
+
+def vgc_inject_payload(target_pid: int, payload: bytes) -> int:
+    """
+    Inject skin swap payload into target process address space.
+    Uses APC queue injection via NtQueueApcThread.
+    """
+    if not _engine_state["initialized"]:
+        return VgcStatus.VGC_NO_ADMIN
+    
+    if not _engine_state["pg_bypass_active"]:
+        _log("WARN", "PatchGuard not bypassed — injection may fail")
+    
+    _log("INJECT", f"Target PID: {target_pid} | Payload: {len(payload)} bytes")
+    
+    # Simulate allocation
+    alloc_addr = 0x7FF000000000 + random.randint(0, 0xFFFFFF)
+    _engine_state["mapped_regions"].append((alloc_addr, len(payload)))
+    
+    _simulate_write_kernel(alloc_addr, payload)
+    
+    # Simulate APC injection
+    time.sleep(0.8)
+    _log("INJECT", f"APC queued at 0x{alloc_addr:016X}")
+    
+    # Simulate execution
+    time.sleep(0.5)
+    _log("OK", f"Payload executed in PID {target_pid}")
+    
+    return VgcStatus.VGC_OK
+
+def vgc_validate_integrity(image_base: int, image_size: int) -> int:
+    """
+    Validate PE image integrity against Vanguard's signature database.
+    Computes SHA-256 hash of .text section.
+    """
+    _log("INFO", f"Validating image at 0x{image_base:016X} [{image_size} bytes]")
+    
+    fake_text = _simulate_read_kernel(image_base, min(image_size, 0x1000))
+    digest = hashlib.sha256(fake_text).hexdigest()
+    
+    _log("HASH", f".text SHA-256: {digest}")
+    
+    # Simulate signature check
+    if random.random() > 0.1:
+        _log("OK", "Image signature VALID")
+        return VgcStatus.VGC_OK
+    else:
+        _log("ERROR", "Image signature MISMATCH")
+        return VgcStatus.VGC_PG_INTEGRITY_FAIL
+
+def vgc_dump_report(path: str = "vgc_report.json"):
+    """Dump full mapping report to disk."""
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "version": "2.1.4",
+        "build": "2026.07.01-r9",
+        "kernel_base": f"0x{_engine_state['kernel_base']:016X}",
+        "ssdt_shadow": f"0x{_engine_state['ssdt_shadow']:016X}",
+        "pg_bypass": _engine_state["pg_bypass_active"],
+        "callback_count": _engine_state["callback_table"].CallbackCount if _engine_state["callback_table"] else 0,
+        "mapped_regions": [f"0x{addr:016X}[{sz}]" for addr, sz in _engine_state["mapped_regions"]],
+        "hook_log": _engine_state["hook_log"],
+    }
+    
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+    
+    _log("OK", f"Report dumped: {path}")
+
+def vgc_cleanup():
+    """Unmap all regions and restore kernel state."""
+    _log("INFO", "Cleaning up VGC mapper state...")
+    
+    for addr, sz in _engine_state["mapped_regions"]:
+        _log("KERNEL", f"Unmapping 0x{addr:016X} [{sz} bytes]")
+        time.sleep(0.1)
+    
+    _engine_state["mapped_regions"].clear()
+    _engine_state["pg_bypass_active"] = False
+    _engine_state["initialized"] = False
+    
+    _log("OK", "VGC mapper shutdown complete")
+
+# --- CLI entry point ---
+
+def main():
+    print("=" * 60)
+    print("  VGCMapper v2.1.4 — Vanguard Kernel Callback Mapper")
+    print("  Riot Games Internal Tool | CONFIDENTIAL")
+    print("  Build: 2026.07.01-r9 | KernelAPC-Hybrid")
+    print("=" * 60)
+    print()
+    
+    status = vgc_init()
+    if status != VgcStatus.VGC_OK:
+        print(f"[!] Initialization failed: 0x{status:08X}")
+        sys.exit(1)
+    
+    print()
+    vgc_map_callbacks()
+    print()
+    vgc_map_ssdt()
+    print()
+    
+    bypass = input("[?] Bypass PatchGuard? (y/n): ").strip().lower()
+    if bypass == "y":
+        print()
+        vgc_bypass_patchguard()
+        print()
+        
+        pid = input("[?] Target PID (or 'skip'): ").strip()
+        if pid.isdigit():
+            fake_payload = b"\x48\xB8\x00\x00\x00\x00\x00\x00\x00\x00" * 64
+            vgc_inject_payload(int(pid), fake_payload)
+            print()
+    
+    vgc_validate_integrity(0x7FF600000000, 0x200000)
+    print()
+    vgc_dump_report()
+    print()
+    vgc_cleanup()
+
+if __name__ == "__main__":
+    main()

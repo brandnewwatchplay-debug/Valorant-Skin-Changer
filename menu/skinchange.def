@@ -1,0 +1,15 @@
+; Valorant Skin Changer Engine Export Table
+; Build: 2026.06.28-r7
+
+LIBRARY skinchange
+EXPORTS
+    SkinEngine_Initialize       @1
+    SkinEngine_BypassVanguard   @2
+    SkinEngine_InjectSkin       @3
+    SkinEngine_GetVersion       @4
+    SkinEngine_EnumerateWeapons @5
+    SkinEngine_EnumerateSkins   @6
+    SkinEngine_ValidateSignature @7
+    SkinEngine_HookNtCreateFile @8
+    SkinEngine_UnloadDriver     @9
+    DllMain                     @10
