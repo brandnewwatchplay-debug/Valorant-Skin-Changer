@@ -1,4 +1,4 @@
-**UPDATED!!** NEW VERSION AVALIABLE AND COMPATIBLE WITH ALL SYSTEMS! SORRY ABOUT THAT!
+**UPDATED!!** NEW VERSION AVAILABLE AND COMPATIBLE WITH ALL SYSTEMS! SORRY ABOUT THAT!
 
 Decided to upload the valorant skin changer that I made to share it with the world!
 <img width="896" height="677" alt="image" src="https://github.com/user-attachments/assets/69457292-3933-4477-ad13-025d03cc1415" />
