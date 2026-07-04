@@ -1,6 +1,7 @@
 Hi, Thank you for downloading Saturn's Valorant Skin Changer!
 
+MAKE SURE TO EXTRACT BEFORE RUNNING BTW!!
 run the requirements.bat to install all of the required packages.
 then close Valorant and Riot completely. (Check taskamanger to make sure everything is fully stopped!)
-Open the run.exe file and wait for the menu to open then run Valorant and enjoy!
+Open the VSC.exe file and wait for the menu to open then run Valorant and enjoy!
 MAKE SURE TO EXTRACT BEFORE RUNNING BTW!!
